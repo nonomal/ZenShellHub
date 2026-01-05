@@ -69,6 +69,6 @@ location = /data.json {
 
 ## 📄 开源协议
 
-本项目采用 [MIT License](https://www.google.com/search?q=LICENSE "null") 开源。
+本项目采用 [MIT License](https://mit-license.org/) 开源。
 
 Designed with ❤️ by [青柠·倾城于你](https://qninq.cn/)
