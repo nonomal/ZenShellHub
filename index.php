@@ -3,13 +3,15 @@
 // 核心后端逻辑 (PHP)
 // ==========================================
 
-// 配置
-$dataFile = __DIR__ . '/data.json';
+// 配置: 优先读取环境变量，以适配 Docker/Vercel 等环境
+$dataFile = getenv('ZEN_DATA_PATH') ?: __DIR__ . '/data.json';
 $htaccessFile = __DIR__ . '/.htaccess';
+$skipHtaccess = getenv('ZEN_SKIP_HTACCESS') === 'true';
 
 // 1. 安全防护：自动创建 .htaccess 禁止直接访问 data.json
-if (!file_exists($htaccessFile)) {
-    @file_put_contents($htaccessFile, "<Files \"data.json\">\n  Order Deny,Allow\n  Deny from all\n</Files>");
+// 注意：如果数据文件不在当前目录，或者明确跳过，则不创建
+if (!$skipHtaccess && dirname($dataFile) === __DIR__ && !file_exists($htaccessFile)) {
+    @file_put_contents($htaccessFile, "<Files \"" . basename($dataFile) . "\">\n  Order Deny,Allow\n  Deny from all\n</Files>");
 }
 
 // 2. 数据层封装
@@ -28,7 +30,27 @@ function loadData() {
 
 function saveData($data) {
     global $dataFile;
-    return @file_put_contents($dataFile, json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE));
+    // 确保目录存在
+    $dir = dirname($dataFile);
+    if (!is_dir($dir)) {
+        // 尝试创建目录，如果失败返回错误
+        if (!@mkdir($dir, 0777, true)) {
+            $err = error_get_last();
+            return "无法创建数据目录 ($dir): " . ($err['message'] ?? '未知权限错误');
+        }
+        // 赋予目录宽松权限以防止 Docker 权限问题
+        @chmod($dir, 0777);
+    }
+    
+    // 尝试写入数据
+    $jsonContent = json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE);
+    $result = @file_put_contents($dataFile, $jsonContent);
+    
+    if ($result === false) {
+        $err = error_get_last();
+        return "写入文件失败 (" . basename($dataFile) . "): " . ($err['message'] ?? 'Permission denied');
+    }
+    return true; // 成功返回 true
 }
 
 // 3. API 路由处理
@@ -48,8 +70,14 @@ if (isset($_GET['action'])) {
         $input = json_decode(file_get_contents('php://input'), true);
         if (empty($input['password'])) { echo json_encode(['status' => 'error', 'message' => '密码不能为空']); exit; }
         $currentData['meta']['password_hash'] = password_hash($input['password'], PASSWORD_DEFAULT);
-        saveData($currentData);
-        echo json_encode(['status' => 'success']);
+        
+        $saveResult = saveData($currentData);
+        if ($saveResult === true) {
+            echo json_encode(['status' => 'success']);
+        } else {
+            http_response_code(500);
+            echo json_encode(['status' => 'error', 'message' => $saveResult]);
+        }
         exit;
     }
 
@@ -69,8 +97,14 @@ if (isset($_GET['action'])) {
         $input = json_decode(file_get_contents('php://input'), true);
         if ($input === null) { http_response_code(400); echo json_encode(['status' => 'error', 'message' => 'Invalid JSON']); exit; }
         $currentData['scripts'] = $input;
-        if (saveData($currentData)) echo json_encode(['status' => 'success']);
-        else { http_response_code(500); echo json_encode(['status' => 'error', 'message' => '写入失败']); }
+        
+        $saveResult = saveData($currentData);
+        if ($saveResult === true) {
+            echo json_encode(['status' => 'success']);
+        } else { 
+            http_response_code(500); 
+            echo json_encode(['status' => 'error', 'message' => $saveResult]); 
+        }
         exit;
     }
     exit;
@@ -198,18 +232,11 @@ if (isset($_GET['action'])) {
                             </button>
                         </div>
                         
-                        {/* === 优化后的介绍文本区域 ===
-                            使用 "占位+绝对定位悬浮" 策略：
-                            1. 占位层：始终显示前2行，并强制最小高度为 2.5rem (约2行)，防止1行时高度跳动。
-                            2. 悬浮层：优化了边框和阴影质感。
-                        */}
                         <div className="group/desc relative z-10 mb-4">
-                            {/* 占位层：负责布局占位，强制 min-h-[2.5rem] */}
                             <p className="text-sm text-gray-500 line-clamp-2 transition-opacity duration-200 group-hover/desc:opacity-0 min-h-[2.5rem]">
                                 {script.description}
                             </p>
                             
-                            {/* 悬浮层：优化质感 (ring-1 ring-black/5) */}
                             <div className="absolute -top-2 -left-3 -right-3 opacity-0 scale-95 pointer-events-none group-hover/desc:opacity-100 group-hover/desc:scale-100 group-hover/desc:pointer-events-auto transition-all duration-200 z-50 origin-top">
                                 <div className="bg-white/90 backdrop-blur-xl rounded-xl shadow-2xl border border-gray-100 ring-1 ring-black/5 p-3 text-sm text-gray-700 leading-relaxed break-words">
                                     {script.description}
@@ -258,8 +285,6 @@ if (isset($_GET['action'])) {
                         if (checkData.needsSetup) {
                             setNeedsSetup(true);
                         } else {
-                            // Only load scripts if: 1. Is Admin OR 2. Is Share View
-                            // This prevents network requests/image loading for unauthorized visitors
                             const localAuth = localStorage.getItem('zen_auth') === 'true';
                             if (localAuth || isShare) {
                                 loadScripts();
@@ -311,27 +336,24 @@ if (isset($_GET['action'])) {
                         localStorage.setItem('zen_auth', 'true'); 
                         setShowLogin(false);
                         
-                        // 登录成功后，如果当前是分享视图，清除 URL 参数并重置视图状态
                         if (window.location.search.includes('ids=')) {
                             window.history.replaceState(null, '', window.location.pathname);
                             setIsSharedView(false);
                         }
 
                         setToast({message: '登录成功', type: 'success'}); 
-                        loadScripts(); // Trigger load on successful login
+                        loadScripts(); 
                     } 
                     else setToast({message: '密码错误', type: 'error'});
                 } catch { alert('登录请求失败'); }
             };
 
-            // Logic: Locked if not admin AND not a share view
             const isLocked = !isAdmin && !isSharedView;
 
             const filteredScripts = useMemo(() => {
                 const params = new URLSearchParams(window.location.search);
                 const sharedIds = params.get('ids') ? params.get('ids').split(',') : null;
                 
-                // If locked, return EMPTY array to prevent rendering and image loading
                 if (isLocked) return [];
 
                 let data = scripts;
@@ -346,7 +368,6 @@ if (isset($_GET['action'])) {
 
             return (
                 <div className="min-h-screen pb-32 relative overflow-x-hidden">
-                    {/* Global Image Portal */}
                     <AnimatePresence>
                         {hoveredImage && (
                             <motion.div initial={{ opacity: 0, scale: 0.9 }} animate={{ opacity: 1, scale: 1 }} exit={{ opacity: 0, scale: 0.9 }} transition={{ type: "spring", stiffness: 300, damping: 25 }} className="fixed inset-0 z-[500] pointer-events-none flex items-center justify-center">
@@ -389,7 +410,6 @@ if (isset($_GET['action'])) {
                     </header>
 
                     <main className="max-w-7xl mx-auto px-6 md:px-12 pt-8 relative min-h-[60vh]">
-                        {/* Locked State: Only show simple prompt, NO SCRIPTS RENDERED to prevent image loading */}
                         {isLocked && !needsSetup && (
                             <div className="absolute inset-0 z-40 flex flex-col items-center justify-center pt-20">
                                 <div className="p-8 bg-white/80 backdrop-blur-2xl rounded-[32px] shadow-2xl border border-white/60 text-center max-w-sm mx-4">
@@ -401,7 +421,6 @@ if (isset($_GET['action'])) {
                             </div>
                         )}
                         
-                        {/* Grid - Only renders if filteredScripts has items (which is empty if locked) */}
                         <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-8 pb-12">
                             <AnimatePresence>
                                 {filteredScripts.map(script => (
@@ -415,7 +434,6 @@ if (isset($_GET['action'])) {
                         </div>
                     </main>
 
-                    {/* Fixed Share Bar - Strictly Centered via Framer Motion X Axis */}
                     <AnimatePresence>
                         {selectedIds.length > 0 && (
                             <motion.div 
